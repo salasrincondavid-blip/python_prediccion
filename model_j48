@@ -1,0 +1,96 @@
+"""
+Módulo reutilizable que emula J48 (C4.5) usando scikit-learn.
+Entrena el árbol de decisión una sola vez al ser importado.
+"""
+
+import os
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+from sklearn.tree import DecisionTreeClassifier
+
+# Definición de columnas esperadas
+_COL_TARGET = "Cliente_Potencial (clase)"
+_COLS_NUM = ["Cantidad_Citas", "Antiguedad_Cuenta", "Tiempo_Entre_Citas"]
+_COLS_CAT = ["Estado_de_Ultima_Cita", "Interes_Vehiculo"]
+_COLS_ALL = [
+    "Cantidad_Citas",
+    "Antiguedad_Cuenta",
+    "Estado_de_Ultima_Cita",
+    "Interes_Vehiculo",
+    "Tiempo_Entre_Citas"
+]
+
+def _inicializar_y_entrenar():
+    """Carga el dataset y entrena el modelo de árbol emulado una sola vez."""
+    ruta_csv = os.path.join(os.path.dirname(__file__), "dataset_usado.csv")
+    df = pd.read_csv(ruta_csv, encoding="utf-8-sig")
+
+    X = df[_COLS_ALL]
+    y = df[_COL_TARGET]
+
+    # Codificador de etiquetas para la variable objetivo
+    label_encoder = LabelEncoder()
+    y_encoded = label_encoder.fit_transform(y)
+
+    # Preprocesador con One-Hot Encoding para variables categóricas
+    preprocesador = ColumnTransformer(
+        transformers=[
+            ("num", "passthrough", _COLS_NUM),
+            ("cat", OneHotEncoder(drop=None, handle_unknown="ignore", sparse_output=False), _COLS_CAT)
+        ]
+    )
+
+    # Clasificador emulando los hiperparámetros de J48 (entropía y min 2 hojas)
+    clasificador = DecisionTreeClassifier(
+        criterion="entropy",
+        min_samples_leaf=2,
+        random_state=42
+    )
+
+    pipeline = Pipeline(steps=[
+        ("preprocesador", preprocesador),
+        ("clasificador", clasificador)
+    ])
+
+    pipeline.fit(X, y_encoded)
+    return pipeline, label_encoder
+
+# Entrenamiento automático en el momento de la importación
+_modelo, _label_encoder = _inicializar_y_entrenar()
+
+
+def predecir(
+    cantidad_citas: int,
+    antiguedad_cuenta: int,
+    estado_ultima_cita: str,
+    interes_vehiculo: str,
+    tiempo_entre_citas: int
+) -> str:
+    """
+    Predice si un cliente es potencial devolviendo 'Sí' o 'No'.
+    
+    Parámetros:
+      - cantidad_citas (int): Número total de citas.
+      - antiguedad_cuenta (int): Días de antigüedad de la cuenta.
+      - estado_ultima_cita (str): 'Aprobada', 'Rechazada' o 'Pendiente'.
+      - interes_vehiculo (str): 'Sí' o 'No'.
+      - tiempo_entre_citas (int): Días transcurridos entre citas.
+    """
+    datos = pd.DataFrame([{
+        "Cantidad_Citas": int(cantidad_citas),
+        "Antiguedad_Cuenta": int(antiguedad_cuenta),
+        "Estado_de_Ultima_Cita": str(estado_ultima_cita),
+        "Interes_Vehiculo": str(interes_vehiculo),
+        "Tiempo_Entre_Citas": int(tiempo_entre_citas)
+    }])
+
+    pred_idx = _modelo.predict(datos)[0]
+    return str(_label_encoder.inverse_transform([pred_idx])[0])
+
+
+# Ejemplo de uso desde el proyecto principal:
+# from modelo_j48 import predecir
+# resultado = predecir(6, 450, "Aprobada", "Sí", 25)  # Retorna: "Sí" o "No"
+
