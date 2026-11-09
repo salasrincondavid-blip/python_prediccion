@@ -67,3 +67,4 @@ La documentación interactiva estará disponible en:
 - `GET /health`: Verificación del estado del servicio.
 - `POST /predecir`: Realiza la predicción para un único cliente.
 - `POST /predecir-batch`: Realiza predicciones en lote para una lista de clientes.
+
