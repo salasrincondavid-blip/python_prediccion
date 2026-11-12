@@ -1,33 +1,37 @@
 """
 ========================================================================================
-Módulo J48.py - Árbol de decisión con Scikit-Learn + Suavizado de Laplace + Umbral
+Módulo J48.py - Árbol de decisión 100% Scikit-Learn + Suavizado de Laplace + Umbral
 ========================================================================================
 Emula J48 con Scikit-Learn (DecisionTreeClassifier, criterion="entropy").
 
 Funcionamiento:
-  1. Si existe 'modelo_sklearn.joblib', se carga.
-  2. Si no existe, se entrena desde 'dataset_usado.csv' y se guarda el .joblib.
-  3. Si no existe ninguno de los dos, se usa el árbol manual de Weka (respaldo),
-     así el servicio nunca se cae.
+  1. Si existe 'modelo_sklearn.joblib' Y está al día con 'dataset_usado.csv', se carga.
+  2. Si el CSV es más nuevo que el .joblib (o el .joblib no existe), se reentrena solo.
+  3. Si no hay CSV ni modelo, el servicio NO arranca (no hay árboles escritos a mano ni
+     reglas "inventadas": toda predicción sale del modelo entrenado con el CSV).
 
-Las probabilidades de cada hoja usan suavizado de Laplace:
+Probabilidades de cada hoja con suavizado de Laplace:
     P(Si) = (casos_Si + 1) / (total_casos + 2)
 y solo se predice "Si" si P(Si) >= UMBRAL_SI.
 
-Para reentrenar con datos nuevos: borra 'modelo_sklearn.joblib' y reinicia el servidor.
+Para reentrenar con datos nuevos: reemplaza 'dataset_usado.csv' y reinicia el servidor.
 ========================================================================================
 """
 
 import os
 import unicodedata
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
+import joblib
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score
+from sklearn.tree import DecisionTreeClassifier
 
 # ---------------------------------------------------------------------------
-# Configuración del negocio
+# Configuración
 # ---------------------------------------------------------------------------
 UMBRAL_SI = 85.0  # Si la probabilidad suavizada de "Si" es menor a esto -> "No"
 
@@ -35,13 +39,11 @@ DIRECTORIO = os.path.dirname(os.path.abspath(__file__))
 RUTA_DATASET = os.path.join(DIRECTORIO, "dataset_usado.csv")
 RUTA_MODELO = os.path.join(DIRECTORIO, "modelo_sklearn.joblib")
 
-# Hiperparámetro que cumple el rol de la "poda" de J48:
-# mínimo de registros por hoja. Con el dataset de 600 filas, un valor bajo (2)
-# sobreajusta (98 hojas); 10 da un árbol de ~31 hojas y mejor precisión validada.
-MIN_MUESTRAS_HOJA = 10
+# Candidatos de "poda" (mínimo de registros por hoja). Se elige el mejor por
+# validación cruzada al entrenar.
+CANDIDATOS_MIN_HOJA = [5, 10, 15, 20, 30]
 
-# Nombres de columna del CSV (se comparan sin tildes, mayúsculas ni símbolos).
-# Se aceptan varios alias por si cambia el encabezado.
+# Alias de encabezados del CSV (se comparan sin tildes, mayúsculas ni símbolos).
 ALIAS_COLUMNAS = {
     "cantidad_citas": ["cantidadcitas"],
     "antiguedad_cuenta": ["antiguedadcuenta"],
@@ -55,7 +57,7 @@ ALIAS_COLUMNAS = {
     "clase": ["clientepotencialclase", "clientepotencial", "clase", "potencial"],
 }
 
-# Columnas numéricas que ve el árbol (las categóricas se convierten a 0/1)
+# Variables que ve el árbol (las categóricas se convierten a 0/1)
 FEATURES = [
     "cantidad_citas",
     "antiguedad_cuenta",
@@ -74,7 +76,7 @@ FEATURES = [
 # ---------------------------------------------------------------------------
 # Normalización de entradas
 # ---------------------------------------------------------------------------
-def _normalizar_texto(valor: str) -> str:
+def _normalizar_texto(valor) -> str:
     """Quita tildes y espacios, y pasa a minúsculas."""
     if valor is None:
         return ""
@@ -93,11 +95,9 @@ def _normalizar_estado(estado: str) -> str:
     return "Pendiente"
 
 
-def _normalizar_interes(interes: str) -> str:
-    s = _normalizar_texto(interes)
-    if s in ("si", "true", "1", "yes", "s"):
-        return "Si"
-    return "No"
+def _normalizar_si_no(valor: str) -> str:
+    """'Sí'/'Si'/true/1/yes -> 'Si'; cualquier otra cosa -> 'No'."""
+    return "Si" if _normalizar_texto(valor) in ("si", "true", "1", "yes", "s") else "No"
 
 
 # ---------------------------------------------------------------------------
@@ -106,174 +106,115 @@ def _normalizar_interes(interes: str) -> str:
 def _prob_laplace(casos_si: float, total: float) -> Tuple[float, float]:
     """Devuelve (prob_si, prob_no) en porcentaje, suavizadas por tamaño de hoja."""
     prob_si = round((casos_si + 1) / (total + 2) * 100.0, 2)
-    prob_no = round(100.0 - prob_si, 2)
-    return prob_si, prob_no
+    return prob_si, round(100.0 - prob_si, 2)
 
 
 # ---------------------------------------------------------------------------
-# Scikit-Learn: construcción de variables, entrenamiento y carga
+# Construcción de variables
 # ---------------------------------------------------------------------------
 def _fila_features(
-    cantidad_citas: float,
-    antiguedad_cuenta: float,
-    estado_ultima_cita: str,
-    interes_vehiculo: str,
-    tiempo_entre_citas: float,
-    asistio_cita: str = "No",
-    tiene_cuota_inicial: str = "No",
-    capacidad_endeudamiento: str = "No",
-    capacidad_financiacion: str = "No",
+    cantidad_citas, antiguedad_cuenta, estado_ultima_cita, interes_vehiculo,
+    tiempo_entre_citas, asistio_cita, tiene_cuota_inicial,
+    capacidad_endeudamiento, capacidad_financiacion,
 ) -> List[float]:
     """Convierte una fila a la lista numérica en el orden de FEATURES."""
     estado = _normalizar_estado(estado_ultima_cita)
-    interes = _normalizar_interes(interes_vehiculo)
-    asistio = _normalizar_interes(asistio_cita)
-    cuota = _normalizar_interes(tiene_cuota_inicial)
-    deuda = _normalizar_interes(capacidad_endeudamiento)
-    finan = _normalizar_interes(capacidad_financiacion)
-
+    si = lambda v: 1.0 if _normalizar_si_no(v) == "Si" else 0.0
     return [
         float(cantidad_citas),
         float(antiguedad_cuenta),
         float(tiempo_entre_citas),
-        1.0 if interes == "Si" else 0.0,
+        si(interes_vehiculo),
         1.0 if estado == "Aprobada" else 0.0,
         1.0 if estado == "Pendiente" else 0.0,
         1.0 if estado == "Rechazada" else 0.0,
-        1.0 if asistio == "Si" else 0.0,
-        1.0 if cuota == "Si" else 0.0,
-        1.0 if deuda == "Si" else 0.0,
-        1.0 if finan == "Si" else 0.0,
+        si(asistio_cita),
+        si(tiene_cuota_inicial),
+        si(capacidad_endeudamiento),
+        si(capacidad_financiacion),
     ]
 
 
-def _entrenar_desde_csv(ruta_csv: str):
-    """Entrena un DecisionTreeClassifier con el dataset y lo devuelve."""
-    import pandas as pd
-    from sklearn.tree import DecisionTreeClassifier
+# ---------------------------------------------------------------------------
+# Entrenamiento y carga
+# ---------------------------------------------------------------------------
+def _entrenar_desde_csv(ruta_csv: str) -> DecisionTreeClassifier:
+    """Entrena el DecisionTreeClassifier con TODAS las columnas del CSV."""
+    df = pd.read_csv(ruta_csv, encoding="utf-8-sig")  # utf-8-sig quita el BOM de Excel
 
-    # utf-8-sig elimina el BOM que Excel agrega al inicio del CSV
-    df = pd.read_csv(ruta_csv, encoding="utf-8-sig")
-
-    # Mapear los encabezados reales a nombres internos
     def _clave(nombre: str) -> str:
         return "".join(ch for ch in _normalizar_texto(nombre) if ch.isalnum())
 
     por_clave = {_clave(c): c for c in df.columns}
     col = {}
-    columnas_obligatorias = ["cantidad_citas", "antiguedad_cuenta", "estado_ultima_cita", "interes_vehiculo", "tiempo_entre_citas", "clase"]
     for interno, alias in ALIAS_COLUMNAS.items():
         encontrada = next((por_clave[a] for a in alias if a in por_clave), None)
-        if encontrada is None and interno in columnas_obligatorias:
+        if encontrada is None:
             raise ValueError(
-                f"No se encontró la columna '{interno}' en {ruta_csv}. "
-                f"Encabezados: {list(df.columns)}"
+                f"Falta la columna '{interno}' en {ruta_csv}. Encabezados: {list(df.columns)}"
             )
-        if encontrada is not None:
-            col[interno] = encontrada
+        col[interno] = encontrada
 
-    X = []
-    for _, r in df.iterrows():
-        # Valores de las columnas adicionales si existen en el CSV, o valor por defecto
-        asistio_val = r[col["asistio_cita"]] if "asistio_cita" in col else ("Si" if _normalizar_estado(r[col["estado_ultima_cita"]]) == "Aprobada" else "No")
-        clase_fila = _normalizar_interes(r[col["clase"]])
-        cuota_val = r[col["tiene_cuota_inicial"]] if "tiene_cuota_inicial" in col else clase_fila
-        deuda_val = r[col["capacidad_endeudamiento"]] if "capacidad_endeudamiento" in col else clase_fila
-        finan_val = r[col["capacidad_financiacion"]] if "capacidad_financiacion" in col else clase_fila
+    X = [
+        _fila_features(*(r[col[k]] for k in ALIAS_COLUMNAS if k != "clase"))
+        for _, r in df.iterrows()
+    ]
+    y = [_normalizar_si_no(v) for v in df[col["clase"]]]
 
-        X.append(
-            _fila_features(
-                r[col["cantidad_citas"]],
-                r[col["antiguedad_cuenta"]],
-                r[col["estado_ultima_cita"]],
-                r[col["interes_vehiculo"]],
-                r[col["tiempo_entre_citas"]],
-                asistio_val,
-                cuota_val,
-                deuda_val,
-                finan_val,
-            )
-        )
-    y = [_normalizar_interes(v) for v in df[col["clase"]]]  # "Sí" -> "Si", "No" -> "No"
-
-    modelo = DecisionTreeClassifier(
-        criterion="entropy",                 # ganancia de información, como J48
-        min_samples_leaf=MIN_MUESTRAS_HOJA,  # controla el sobreajuste (poda)
-        random_state=42,
+    # "Poda": se elige min_samples_leaf por validación cruzada estratificada
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    busqueda = GridSearchCV(
+        DecisionTreeClassifier(criterion="entropy", random_state=42),  # ganancia de información
+        {"min_samples_leaf": CANDIDATOS_MIN_HOJA},
+        cv=cv, scoring="accuracy",
     )
-    modelo.fit(X, y)
-    print(f" [J48] Entrenado con {len(X)} registros, {modelo.get_n_leaves()} hojas.")
+    busqueda.fit(X, y)
+    modelo = busqueda.best_estimator_  # ya reentrenado con todo el dataset
+
+    print(f" [J48] Entrenado con {len(X)} registros | min_samples_leaf="
+          f"{busqueda.best_params_['min_samples_leaf']} | {modelo.get_n_leaves()} hojas | "
+          f"precisión CV={busqueda.best_score_:.3f}")
     return modelo
 
 
-def _cargar_modelo_sklearn():
-    """Carga el .joblib, o lo entrena desde el CSV. Devuelve None si no hay nada."""
-    try:
-        import joblib
+def _cargar_modelo() -> DecisionTreeClassifier:
+    """Carga el .joblib si está al día; si no, reentrena desde el CSV."""
+    hay_csv = os.path.exists(RUTA_DATASET)
+    hay_modelo = os.path.exists(RUTA_MODELO)
 
-        if os.path.exists(RUTA_MODELO):
-            print(f" [J48] Modelo Scikit-Learn cargado desde {RUTA_MODELO}")
-            return joblib.load(RUTA_MODELO)
-
-        if os.path.exists(RUTA_DATASET):
-            modelo = _entrenar_desde_csv(RUTA_DATASET)
-            joblib.dump(modelo, RUTA_MODELO)
-            print(f" [J48] Modelo entrenado desde {RUTA_DATASET} y guardado en {RUTA_MODELO}")
+    if hay_modelo and (not hay_csv or os.path.getmtime(RUTA_MODELO) >= os.path.getmtime(RUTA_DATASET)):
+        modelo = joblib.load(RUTA_MODELO)
+        if getattr(modelo, "n_features_in_", None) == len(FEATURES):
+            print(f" [J48] Modelo cargado desde {RUTA_MODELO}")
             return modelo
+        print(" [J48] El .joblib no coincide con las variables actuales; se reentrena.")
 
-        print(" [J48] AVISO: no hay modelo ni dataset.csv. Se usa el árbol manual de Weka.")
-        return None
-    except Exception as e:
-        print(f" [J48] AVISO: no se pudo usar Scikit-Learn ({e}). Se usa el árbol manual de Weka.")
-        return None
+    if not hay_csv:
+        raise FileNotFoundError(f"No existe {RUTA_DATASET} ni un modelo válido para cargar.")
+
+    modelo = _entrenar_desde_csv(RUTA_DATASET)
+    joblib.dump(modelo, RUTA_MODELO)
+    print(f" [J48] Modelo guardado en {RUTA_MODELO}")
+    return modelo
 
 
-MODELO_SKLEARN = _cargar_modelo_sklearn()
+MODELO = _cargar_modelo()
 
 
-def _hoja_sklearn(modelo, fila: List[float]) -> Tuple[float, float]:
+def _hoja(modelo: DecisionTreeClassifier, fila: List[float]) -> Tuple[float, float]:
     """Devuelve (casos_Si, total_casos) de la hoja donde cae la fila."""
     hoja = int(modelo.apply([fila])[0])
     arbol = modelo.tree_
-    valores = arbol.value[hoja][0]          # compatible con versiones que guardan conteos o fracciones
+    valores = arbol.value[hoja][0]
     total = float(arbol.n_node_samples[hoja])
     suma = float(valores.sum())
     clases = list(modelo.classes_)
-    casos_si = 0.0
-    if "Si" in clases and suma > 0:
-        casos_si = float(valores[clases.index("Si")]) / suma * total
+    casos_si = float(valores[clases.index("Si")]) / suma * total if "Si" in clases and suma > 0 else 0.0
     return casos_si, total
 
 
 # ---------------------------------------------------------------------------
-# Árbol manual de Weka (respaldo cuando no hay modelo de Scikit-Learn)
-# ---------------------------------------------------------------------------
-def _hoja_manual(
-    citas: float, antiguedad: float, estado: str, interes: str, tiempo: float
-) -> Tuple[int, int]:
-    """Cada hoja: (casos de clase Si, total de casos) del J48 original."""
-    if interes == "No":
-        if citas <= 5:
-            return (1, 28)
-        elif estado == "Rechazada":
-            return (1, 3) if citas <= 9 else (2, 2)
-        elif estado == "Pendiente":
-            return (4, 13)
-        else:  # Aprobada
-            return (3, 4)
-    else:  # interes == "Si"
-        if estado == "Rechazada":
-            if antiguedad <= 395:
-                return (3, 3)
-            return (1, 6) if tiempo <= 30 else (2, 2)
-        elif estado == "Pendiente":
-            return (10, 10) if antiguedad <= 652 else (2, 8)
-        else:  # Aprobada
-            return (8, 8)
-
-
-# ---------------------------------------------------------------------------
-# Motor de inferencia (mismo nombre y misma firma que antes)
+# Motor de inferencia (mismo nombre y firma que antes)
 # ---------------------------------------------------------------------------
 def evaluar_arbol_weka(
     cantidad_citas: float,
@@ -286,49 +227,14 @@ def evaluar_arbol_weka(
     capacidad_endeudamiento: str = "No",
     capacidad_financiacion: str = "No",
 ) -> Tuple[str, float, float]:
-    """Retorna (prediccion, prob_si, prob_no). Usa Scikit-Learn si está disponible."""
-    if MODELO_SKLEARN is not None:
-        fila = _fila_features(
-            cantidad_citas, antiguedad_cuenta, estado_ultima_cita,
-            interes_vehiculo, tiempo_entre_citas,
-            asistio_cita, tiene_cuota_inicial,
-            capacidad_endeudamiento, capacidad_financiacion,
-        )
-        casos_si, total = _hoja_sklearn(MODELO_SKLEARN, fila)
-    else:
-        casos_si, total = _hoja_manual(
-            float(cantidad_citas),
-            float(antiguedad_cuenta),
-            _normalizar_estado(estado_ultima_cita),
-            _normalizar_interes(interes_vehiculo),
-            float(tiempo_entre_citas),
-        )
-
+    """Retorna (prediccion, prob_si, prob_no). Todo sale del árbol + Laplace + umbral."""
+    fila = _fila_features(
+        cantidad_citas, antiguedad_cuenta, estado_ultima_cita, interes_vehiculo,
+        tiempo_entre_citas, asistio_cita, tiene_cuota_inicial,
+        capacidad_endeudamiento, capacidad_financiacion,
+    )
+    casos_si, total = _hoja(MODELO, fila)
     prob_si, prob_no = _prob_laplace(casos_si, total)
-
-    # REGLAS DE NEGOCIO EXPERTAS (Alineadas a la realidad del concesionario):
-    cuota_ok = _normalizar_interes(tiene_cuota_inicial) == "Si"
-    finan_ok = _normalizar_interes(capacidad_financiacion) == "Si"
-    deuda_ok = _normalizar_interes(capacidad_endeudamiento) == "Si"
-    asistio_ok = _normalizar_interes(asistio_cita) == "Si"
-
-    # Caso 1: Perfil financiero y comercial completo (Excelente prospecto)
-    if asistio_ok and cuota_ok and finan_ok and deuda_ok:
-        prob_si = max(prob_si, 95.0)
-        prob_no = round(100.0 - prob_si, 2)
-
-    # Caso 2: Tiene buen historial crediticio (endeudamiento Si) pero NO tiene capacidad de pago para este auto (financiacion No)
-    elif deuda_ok and not finan_ok:
-        # El banco le negará el crédito para este auto específico. No puede comprar inmediatamente este modelo.
-        # Su probabilidad se sitúa en zona de renegociación (60% - 68%), por debajo del umbral del 85%.
-        prob_si = min(prob_si, 65.0)
-        prob_no = round(100.0 - prob_si, 2)
-
-    # Caso 3: No tiene cuota inicial ni capacidad de financiación
-    elif not cuota_ok and not finan_ok:
-        prob_si = min(prob_si, 25.0)
-        prob_no = round(100.0 - prob_si, 2)
-
     pred = "Si" if prob_si >= UMBRAL_SI else "No"
     return pred, prob_si, prob_no
 
@@ -336,30 +242,26 @@ def evaluar_arbol_weka(
 # ---------------------------------------------------------------------------
 # API Python directa
 # ---------------------------------------------------------------------------
-def predecir(
-    cantidad_citas: int,
-    antiguedad_cuenta: int,
-    estado_ultima_cita: str,
-    interes_vehiculo: str,
-    tiempo_entre_citas: int,
-) -> str:
+def predecir(cantidad_citas, antiguedad_cuenta, estado_ultima_cita, interes_vehiculo,
+             tiempo_entre_citas, asistio_cita="No", tiene_cuota_inicial="No",
+             capacidad_endeudamiento="No", capacidad_financiacion="No") -> str:
     """Devuelve 'Si' o 'No'."""
-    pred, _, _ = evaluar_arbol_weka(
-        cantidad_citas, antiguedad_cuenta, estado_ultima_cita, interes_vehiculo, tiempo_entre_citas
-    )
-    return pred
+    return evaluar_arbol_weka(
+        cantidad_citas, antiguedad_cuenta, estado_ultima_cita, interes_vehiculo,
+        tiempo_entre_citas, asistio_cita, tiene_cuota_inicial,
+        capacidad_endeudamiento, capacidad_financiacion,
+    )[0]
 
 
-def predecir_con_probabilidad(
-    cantidad_citas: int,
-    antiguedad_cuenta: int,
-    estado_ultima_cita: str,
-    interes_vehiculo: str,
-    tiempo_entre_citas: int,
-) -> dict:
+def predecir_con_probabilidad(cantidad_citas, antiguedad_cuenta, estado_ultima_cita,
+                              interes_vehiculo, tiempo_entre_citas, asistio_cita="No",
+                              tiene_cuota_inicial="No", capacidad_endeudamiento="No",
+                              capacidad_financiacion="No") -> dict:
     """Devuelve la predicción con sus probabilidades."""
     pred, prob_si, prob_no = evaluar_arbol_weka(
-        cantidad_citas, antiguedad_cuenta, estado_ultima_cita, interes_vehiculo, tiempo_entre_citas
+        cantidad_citas, antiguedad_cuenta, estado_ultima_cita, interes_vehiculo,
+        tiempo_entre_citas, asistio_cita, tiene_cuota_inicial,
+        capacidad_endeudamiento, capacidad_financiacion,
     )
     confianza_pct = prob_si if pred == "Si" else prob_no
     return {
@@ -371,12 +273,12 @@ def predecir_con_probabilidad(
 
 
 # ---------------------------------------------------------------------------
-# SERVIDOR FASTAPI (sin cambios en endpoints ni modelos)
+# SERVIDOR FASTAPI (endpoints y modelos de respuesta sin cambios)
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="NextGen Motors - ML J48 Prediction API",
     description="Servicio FastAPI basado en J48 (Scikit-Learn) con suavizado de Laplace y umbral estricto.",
-    version="2.0.0",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -395,7 +297,7 @@ class PrediccionRequest(BaseModel):
     interes_vehiculo: str = Field(default="No", validation_alias="interes_vehiculo")
     tiempo_entre_citas: float = Field(default=0.0, validation_alias="tiempo_entre_citas")
 
-    # Nuevas variables post-cita (comerciales y financieras)
+    # Variables post-cita (comerciales y financieras)
     asistio_cita: str = Field(default="No", validation_alias="asistio_cita")
     tiene_cuota_inicial: str = Field(default="No", validation_alias="tiene_cuota_inicial")
     capacidad_endeudamiento: str = Field(default="No", validation_alias="capacidad_endeudamiento")
@@ -414,19 +316,12 @@ class PrediccionResponse(BaseModel):
 
 def _ejecutar_prediccion(req: PrediccionRequest) -> PrediccionResponse:
     pred, prob_si, prob_no = evaluar_arbol_weka(
-        req.cantidad_citas,
-        req.antiguedad_cuenta,
-        req.estado_ultima_cita,
-        req.interes_vehiculo,
-        req.tiempo_entre_citas,
-        req.asistio_cita,
-        req.tiene_cuota_inicial,
-        req.capacidad_endeudamiento,
-        req.capacidad_financiacion,
+        req.cantidad_citas, req.antiguedad_cuenta, req.estado_ultima_cita,
+        req.interes_vehiculo, req.tiempo_entre_citas, req.asistio_cita,
+        req.tiene_cuota_inicial, req.capacidad_endeudamiento, req.capacidad_financiacion,
     )
     es_potencial = pred == "Si"
     prob_pred = prob_si if es_potencial else prob_no
-
     return PrediccionResponse(
         prediccion=pred,
         probabilidad=prob_pred,
@@ -441,9 +336,7 @@ def raiz():
     return {
         "servicio": "NextGen Motors - ML J48 Prediction API",
         "estado": "activo",
-        "modelo": "J48 (Scikit-Learn) con Laplace y umbral estricto"
-        if MODELO_SKLEARN is not None
-        else "J48 (modelo_PA.model) con Laplace y umbral estricto",
+        "modelo": "J48 (Scikit-Learn) con Laplace y umbral estricto",
         "umbral_si": UMBRAL_SI,
         "docs": "/docs",
     }
@@ -451,11 +344,7 @@ def raiz():
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "modelo": "J48 Scikit-Learn + Laplace" if MODELO_SKLEARN is not None else "J48 Weka + Laplace",
-        "umbral_si": UMBRAL_SI,
-    }
+    return {"status": "ok", "modelo": "J48 Scikit-Learn + Laplace", "umbral_si": UMBRAL_SI}
 
 
 @app.post("/predecir", response_model=PrediccionResponse)
