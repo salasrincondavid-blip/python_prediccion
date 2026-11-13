@@ -14,6 +14,16 @@ Probabilidades de cada hoja con suavizado de Laplace:
     P(Si) = (casos_Si + 1) / (total_casos + 2)
 y solo se predice "Si" si P(Si) >= UMBRAL_SI.
 
+Estado de la cita:
+  * Aprobada / Pendiente / Rechazada -> la cita aún no se ha atendido: solo cuentan las
+    5 variables principales. Asistió, cuota, endeudamiento y financiación se ignoran
+    (aún no fueron evaluadas, así que "No" por defecto NO significa "evaluado y dio No").
+  * Completada -> el asesor ya atendió al cliente: ahora SÍ cuentan las 4 variables
+    post-cita y son las que definen si es cliente potencial.
+
+Respuesta de la API: "probabilidad" (y "confianza") es SIEMPRE el % de ser cliente potencial
+(Si), no el de la clase ganadora. "detalle" trae Si y No por separado.
+
 Para reentrenar con datos nuevos: reemplaza 'dataset_usado.csv' y reinicia el servidor.
 ========================================================================================
 """
@@ -41,7 +51,7 @@ RUTA_MODELO = os.path.join(DIRECTORIO, "modelo_sklearn.joblib")
 
 # Candidatos de "poda" (mínimo de registros por hoja). Se elige el mejor por
 # validación cruzada al entrenar.
-CANDIDATOS_MIN_HOJA = [5, 10, 15, 20, 30]
+CANDIDATOS_MIN_HOJA = [5, 8, 10, 15, 20, 30]
 
 # Alias de encabezados del CSV (se comparan sin tildes, mayúsculas ni símbolos).
 ALIAS_COLUMNAS = {
@@ -66,6 +76,7 @@ FEATURES = [
     "estado_aprobada",
     "estado_pendiente",
     "estado_rechazada",
+    "estado_completada",
     "asistio_si",
     "cuota_inicial_si",
     "endeudamiento_si",
@@ -88,6 +99,8 @@ def _normalizar_texto(valor) -> str:
 
 def _normalizar_estado(estado: str) -> str:
     s = _normalizar_texto(estado)
+    if "complet" in s:
+        return "Completada"
     if "aprob" in s:
         return "Aprobada"
     if "rechaz" in s or "cancel" in s:
@@ -119,7 +132,11 @@ def _fila_features(
 ) -> List[float]:
     """Convierte una fila a la lista numérica en el orden de FEATURES."""
     estado = _normalizar_estado(estado_ultima_cita)
+    # Las variables post-cita solo existen si la cita ya fue atendida (Completada).
+    # En cualquier otro estado se anulan, igual en entrenamiento y en predicción.
+    post = estado == "Completada"
     si = lambda v: 1.0 if _normalizar_si_no(v) == "Si" else 0.0
+    sp = lambda v: si(v) if post else 0.0
     return [
         float(cantidad_citas),
         float(antiguedad_cuenta),
@@ -128,10 +145,11 @@ def _fila_features(
         1.0 if estado == "Aprobada" else 0.0,
         1.0 if estado == "Pendiente" else 0.0,
         1.0 if estado == "Rechazada" else 0.0,
-        si(asistio_cita),
-        si(tiene_cuota_inicial),
-        si(capacidad_endeudamiento),
-        si(capacidad_financiacion),
+        1.0 if estado == "Completada" else 0.0,
+        sp(asistio_cita),
+        sp(tiene_cuota_inicial),
+        sp(capacidad_endeudamiento),
+        sp(capacidad_financiacion),
     ]
 
 
@@ -263,11 +281,11 @@ def predecir_con_probabilidad(cantidad_citas, antiguedad_cuenta, estado_ultima_c
         tiempo_entre_citas, asistio_cita, tiene_cuota_inicial,
         capacidad_endeudamiento, capacidad_financiacion,
     )
-    confianza_pct = prob_si if pred == "Si" else prob_no
+    # "probabilidad" y "confianza" son SIEMPRE la probabilidad de ser cliente potencial (Si)
     return {
         "respuesta": pred,
-        "confianza": round(confianza_pct / 100.0, 4),
-        "probabilidad": confianza_pct,
+        "confianza": round(prob_si / 100.0, 4),
+        "probabilidad": prob_si,
         "detalle": {"Si": prob_si, "No": prob_no},
     }
 
@@ -321,11 +339,12 @@ def _ejecutar_prediccion(req: PrediccionRequest) -> PrediccionResponse:
         req.tiene_cuota_inicial, req.capacidad_endeudamiento, req.capacidad_financiacion,
     )
     es_potencial = pred == "Si"
-    prob_pred = prob_si if es_potencial else prob_no
+    # "probabilidad" y "confianza" son SIEMPRE la probabilidad de ser cliente potencial (Si),
+    # así un "No" con 27% se ve como 27% y no como 73%.
     return PrediccionResponse(
         prediccion=pred,
-        probabilidad=prob_pred,
-        confianza=round(prob_pred / 100.0, 4),
+        probabilidad=prob_si,
+        confianza=round(prob_si / 100.0, 4),
         es_potencial=es_potencial,
         detalle={"Si": prob_si, "No": prob_no},
     )
